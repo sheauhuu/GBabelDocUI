@@ -345,7 +345,9 @@
             }
 
             // Find the button that triggered this download
-            const btn = event && event.currentTarget ? event.currentTarget :
+            const clickedBtn = (typeof event !== 'undefined' && event && event.currentTarget)
+                ? event.currentTarget : null;
+            const btn = clickedBtn ||
                 (fileType === 'mono' ? document.getElementById('download-mono-btn') :
                     document.getElementById('download-dual-btn'));
 
@@ -361,11 +363,13 @@
                 const token = localStorage.getItem('auth_token');
                 const response = await fetch(`/api/translate/download/${downloadTaskId}?file_type=${fileType}`, {
                     headers: {
-                        'Authorization': `Bearer ${token}`
-                    }
+                        'Authorization': `Bearer ${token}`,
+                        'Range': 'bytes=0-'
+                    },
+                    cache: 'no-store'
                 });
 
-                if (!response.ok) {
+                if (!response.ok && response.status !== 206) {
                     const errorData = await response.json().catch(() => ({}));
                     throw new Error(errorData.detail || `Download failed (${response.status})`);
                 }
@@ -374,53 +378,26 @@
                 const contentDisposition = response.headers.get('Content-Disposition');
                 let filename = `translated_${fileType}.pdf`;
                 if (contentDisposition) {
-                    const match = contentDisposition.match(/filename="?([^";\n]+)"?/);
+                    const match = contentDisposition.match(/filename\*?=(?:UTF-8''|"?)([^";\n]+)"?/i);
                     if (match) {
-                        filename = match[1];
+                        filename = decodeURIComponent(match[1]);
                     }
                 }
 
-                const contentLength = response.headers.get('Content-Length');
-                const totalSize = contentLength ? parseInt(contentLength, 10) : 0;
-
-                // For large files (>5MB) with known size, show download progress
-                if (totalSize > 5 * 1024 * 1024 && response.body) {
-                    const reader = response.body.getReader();
-                    const chunks = [];
-                    let receivedLength = 0;
-
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        chunks.push(value);
-                        receivedLength += value.length;
-                        const percent = Math.round((receivedLength / totalSize) * 100);
-                        if (btn) {
-                            btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>${percent}%</span>`;
-                        }
-                    }
-
-                    const blob = new Blob(chunks, { type: 'application/pdf' });
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
+                // Read the full response as blob
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                // Delay cleanup to ensure download starts
+                setTimeout(() => {
                     document.body.removeChild(a);
                     window.URL.revokeObjectURL(url);
-                } else {
-                    // Small file or unknown size: download directly
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    window.URL.revokeObjectURL(url);
-                }
+                }, 100);
 
                 showAlert(i18n.t('upload.download.success') || 'Download complete!', 'success');
             } catch (error) {
