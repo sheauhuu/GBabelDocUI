@@ -11,6 +11,7 @@ This module provides REST API endpoints for:
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,10 @@ user_manager = UserManager()
 
 # In-memory storage for active translation tasks
 active_tasks = {}
+
+# Concurrency control for translations
+MAX_CONCURRENT_TRANSLATIONS = int(os.environ.get("MAX_CONCURRENT_TRANSLATIONS", "1"))
+translation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
 
 
 # Pydantic models for request/response
@@ -415,10 +420,10 @@ async def get_settings(current_user: dict = Depends(get_current_user)):
     settings_file = user_dir / "settings.json"
     
     if settings_file.exists():
-        settings = json.loads(settings_file.read_text())
+        settings = json.loads(await asyncio.to_thread(settings_file.read_text))
     else:
         settings = {}
-    
+
     return {"success": True, "settings": settings}
 
 
@@ -429,8 +434,8 @@ async def update_settings(settings: dict, current_user: dict = Depends(get_curre
     user_dir.mkdir(parents=True, exist_ok=True)
     settings_file = user_dir / "settings.json"
     
-    settings_file.write_text(json.dumps(settings, indent=2))
-    
+    await asyncio.to_thread(settings_file.write_text, json.dumps(settings, indent=2))
+
     return {"success": True, "message": "Settings updated successfully"}
 
 
@@ -454,8 +459,8 @@ async def reset_settings(current_user: dict = Depends(get_current_user)):
     user_dir = user_manager.get_user_dir(current_user['username'])
     settings_file = user_dir / "settings.json"
     
-    settings_file.write_text("{}")
-    
+    await asyncio.to_thread(settings_file.write_text, "{}")
+
     return {"success": True, "message": "Settings reset to default"}
 
 
@@ -467,10 +472,10 @@ async def export_settings(current_user: dict = Depends(get_current_user)):
     
     # Load current settings
     if settings_file.exists():
-        settings = json.loads(settings_file.read_text())
+        settings = json.loads(await asyncio.to_thread(settings_file.read_text))
     else:
         settings = {}
-    
+
     # Create export data with metadata
     export_data = {
         "version": "1.0",
@@ -531,7 +536,7 @@ async def import_settings(
         settings_file = user_dir / "settings.json"
         
         # Write settings
-        settings_file.write_text(json.dumps(imported_settings, indent=2, ensure_ascii=False))
+        await asyncio.to_thread(settings_file.write_text, json.dumps(imported_settings, indent=2, ensure_ascii=False))
         
         # Count imported settings
         setting_count = len(imported_settings)
@@ -640,107 +645,111 @@ async def run_translation(task_id: str, file_path: Path, output_dir: Path, trans
     mono_path = None
     dual_path = None
     original_filename = file_path.stem  # Get filename without extension
-    
+
     try:
-        active_tasks[task_id]["status"] = "processing"
-        active_tasks[task_id]["message"] = "Loading user settings..."
-        active_tasks[task_id]["original_filename"] = original_filename  # Store for download filename
-        
-        # Load user settings
-        user_dir = user_manager.get_user_dir(username)
-        settings_file = user_dir / "settings.json"
-        user_settings = json.loads(settings_file.read_text()) if settings_file.exists() else {}
-        
-        # Get pages from translation_settings if provided
-        pages = translation_settings.get('pages') if translation_settings else None
-        
-        logger.info(f"Starting translation task {task_id} for user {username}")
-        logger.info(f"User settings: {user_settings}")
-        
-        # Build SettingsModel from user config
-        settings = build_settings_model_from_user_config(user_settings, output_dir, pages)
-        
-        # Validate settings
-        try:
-            settings.validate_settings()
-        except ValueError as e:
-            raise ValueError(f"Invalid translation settings: {e}")
-        
-        active_tasks[task_id]["message"] = "Starting translation..."
-        
-        # Run translation using do_translate_async_stream
-        async for event in do_translate_async_stream(settings, file_path):
-            if event["type"] in ("progress_start", "progress_update", "progress_end"):
-                # Update progress
-                stage = event.get("stage", "Processing")
-                progress = event.get("overall_progress", 0)
-                part_index = event.get("part_index", 1)
-                total_parts = event.get("total_parts", 1)
-                stage_current = event.get("stage_current", 0)
-                stage_total = event.get("stage_total", 1)
-                
-                message = f"{stage} ({part_index}/{total_parts}, {stage_current}/{stage_total})"
-                
-                active_tasks[task_id]["progress"] = int(progress)
-                active_tasks[task_id]["message"] = message
-                
-                logger.debug(f"Task {task_id}: {progress}% - {message}")
-                
-            elif event["type"] == "finish":
-                # Translation completed
-                result = event["translate_result"]
-                
-                # Get actual output paths from the result
-                result_mono_path = result.mono_pdf_path
-                result_dual_path = result.dual_pdf_path
-                
-                # Rename output files to use original filename
-                if result_mono_path and result_mono_path.exists():
-                    mono_path = output_dir / f"{original_filename}_mono.pdf"
-                    result_mono_path.rename(mono_path)
-                    logger.info(f"Mono PDF saved: {mono_path}")
-                
-                if result_dual_path and result_dual_path.exists():
-                    dual_path = output_dir / f"{original_filename}_dual.pdf"
-                    result_dual_path.rename(dual_path)
-                    logger.info(f"Dual PDF saved: {dual_path}")
-                
-                # Get token usage if available
-                token_usage = event.get("token_usage", {})
-                
-                break
-                
-            elif event["type"] == "error":
-                error_msg = event.get("error", "Unknown error")
-                raise RuntimeError(f"Translation error: {error_msg}")
-        
-        # Mark as complete
-        active_tasks[task_id]["status"] = "completed"
-        active_tasks[task_id]["progress"] = 100
-        active_tasks[task_id]["message"] = "Translation completed"
-        active_tasks[task_id]["output_files"] = {
-            "mono": str(mono_path) if mono_path else None,
-            "dual": str(dual_path) if dual_path else None
-        }
+        active_tasks[task_id]["status"] = "queued"
+        active_tasks[task_id]["message"] = "Waiting in queue..."
         active_tasks[task_id]["original_filename"] = original_filename
-        
-        # Update user history
-        history_file = user_dir / "history.json"
-        history = json.loads(history_file.read_text()) if history_file.exists() else []
-        history.append({
-            "task_id": task_id,
-            "file_id": active_tasks[task_id].get("file_id"),
-            "filename": file_path.name,
-            "original_filename": original_filename,
-            "created_at": active_tasks[task_id]["created_at"],
-            "completed_at": datetime.utcnow().isoformat(),
-            "status": "completed",
-            "mono_path": str(mono_path) if mono_path else None,
-            "dual_path": str(dual_path) if dual_path else None
-        })
-        history_file.write_text(json.dumps(history, indent=2))
-        
-        logger.info(f"Translation task {task_id} completed successfully")
+
+        async with translation_semaphore:
+            active_tasks[task_id]["status"] = "processing"
+            active_tasks[task_id]["message"] = "Loading user settings..."
+
+            # Load user settings
+            user_dir = user_manager.get_user_dir(username)
+            settings_file = user_dir / "settings.json"
+            user_settings = json.loads(await asyncio.to_thread(settings_file.read_text)) if settings_file.exists() else {}
+
+            # Get pages from translation_settings if provided
+            pages = translation_settings.get('pages') if translation_settings else None
+
+            logger.info(f"Starting translation task {task_id} for user {username}")
+            logger.info(f"User settings: {user_settings}")
+
+            # Build SettingsModel from user config
+            settings = build_settings_model_from_user_config(user_settings, output_dir, pages)
+
+            # Validate settings
+            try:
+                settings.validate_settings()
+            except ValueError as e:
+                raise ValueError(f"Invalid translation settings: {e}")
+
+            active_tasks[task_id]["message"] = "Starting translation..."
+
+            # Run translation using do_translate_async_stream
+            async for event in do_translate_async_stream(settings, file_path):
+                if event["type"] in ("progress_start", "progress_update", "progress_end"):
+                    # Update progress
+                    stage = event.get("stage", "Processing")
+                    progress = event.get("overall_progress", 0)
+                    part_index = event.get("part_index", 1)
+                    total_parts = event.get("total_parts", 1)
+                    stage_current = event.get("stage_current", 0)
+                    stage_total = event.get("stage_total", 1)
+
+                    message = f"{stage} ({part_index}/{total_parts}, {stage_current}/{stage_total})"
+
+                    active_tasks[task_id]["progress"] = int(progress)
+                    active_tasks[task_id]["message"] = message
+
+                    logger.debug(f"Task {task_id}: {progress}% - {message}")
+
+                elif event["type"] == "finish":
+                    # Translation completed
+                    result = event["translate_result"]
+
+                    # Get actual output paths from the result
+                    result_mono_path = result.mono_pdf_path
+                    result_dual_path = result.dual_pdf_path
+
+                    # Rename output files to use original filename
+                    if result_mono_path and result_mono_path.exists():
+                        mono_path = output_dir / f"{original_filename}_mono.pdf"
+                        result_mono_path.rename(mono_path)
+                        logger.info(f"Mono PDF saved: {mono_path}")
+
+                    if result_dual_path and result_dual_path.exists():
+                        dual_path = output_dir / f"{original_filename}_dual.pdf"
+                        result_dual_path.rename(dual_path)
+                        logger.info(f"Dual PDF saved: {dual_path}")
+
+                    # Get token usage if available
+                    token_usage = event.get("token_usage", {})
+
+                    break
+
+                elif event["type"] == "error":
+                    error_msg = event.get("error", "Unknown error")
+                    raise RuntimeError(f"Translation error: {error_msg}")
+
+            # Mark as complete
+            active_tasks[task_id]["status"] = "completed"
+            active_tasks[task_id]["progress"] = 100
+            active_tasks[task_id]["message"] = "Translation completed"
+            active_tasks[task_id]["output_files"] = {
+                "mono": str(mono_path) if mono_path else None,
+                "dual": str(dual_path) if dual_path else None
+            }
+            active_tasks[task_id]["original_filename"] = original_filename
+
+            # Update user history
+            history_file = user_dir / "history.json"
+            history = json.loads(await asyncio.to_thread(history_file.read_text)) if history_file.exists() else []
+            history.append({
+                "task_id": task_id,
+                "file_id": active_tasks[task_id].get("file_id"),
+                "filename": file_path.name,
+                "original_filename": original_filename,
+                "created_at": active_tasks[task_id]["created_at"],
+                "completed_at": datetime.utcnow().isoformat(),
+                "status": "completed",
+                "mono_path": str(mono_path) if mono_path else None,
+                "dual_path": str(dual_path) if dual_path else None
+            })
+            await asyncio.to_thread(history_file.write_text, json.dumps(history, indent=2))
+
+            logger.info(f"Translation task {task_id} completed successfully")
         
     except Exception as e:
         logger.error(f"Translation task {task_id} failed: {e}", exc_info=True)
@@ -751,7 +760,7 @@ async def run_translation(task_id: str, file_path: Path, output_dir: Path, trans
         try:
             user_dir = user_manager.get_user_dir(username)
             history_file = user_dir / "history.json"
-            history = json.loads(history_file.read_text()) if history_file.exists() else []
+            history = json.loads(await asyncio.to_thread(history_file.read_text)) if history_file.exists() else []
             history.append({
                 "task_id": task_id,
                 "filename": file_path.name,
@@ -760,7 +769,7 @@ async def run_translation(task_id: str, file_path: Path, output_dir: Path, trans
                 "status": "failed",
                 "error": str(e)
             })
-            history_file.write_text(json.dumps(history, indent=2))
+            await asyncio.to_thread(history_file.write_text, json.dumps(history, indent=2))
         except Exception as hist_error:
             logger.error(f"Failed to update history: {hist_error}")
 
@@ -787,10 +796,10 @@ async def get_translation_history(current_user: dict = Depends(get_current_user)
     history_file = user_dir / "history.json"
     
     if history_file.exists():
-        history = json.loads(history_file.read_text())
+        history = json.loads(await asyncio.to_thread(history_file.read_text))
     else:
         history = []
-    
+
     return {"success": True, "history": history}
 
 
@@ -805,8 +814,8 @@ async def delete_history_item(task_id: str, current_user: dict = Depends(get_cur
     if not history_file.exists():
         raise HTTPException(status_code=404, detail="History not found")
     
-    history = json.loads(history_file.read_text())
-    
+    history = json.loads(await asyncio.to_thread(history_file.read_text))
+
     # Find the history item
     item_to_delete = None
     for item in history:
@@ -834,7 +843,7 @@ async def delete_history_item(task_id: str, current_user: dict = Depends(get_cur
     
     # Remove from history
     history = [item for item in history if item.get('task_id') != task_id]
-    history_file.write_text(json.dumps(history, indent=2))
+    await asyncio.to_thread(history_file.write_text, json.dumps(history, indent=2))
     
     # Remove from active_tasks if exists
     if task_id in active_tasks:
@@ -850,42 +859,55 @@ async def download_translation(
     current_user: dict = Depends(get_current_user)
 ):
     """Download a translated file"""
-    if task_id not in active_tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    task = active_tasks[task_id]
-    
-    # Verify task belongs to current user
-    if task["username"] != current_user['username']:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if task["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Translation not completed")
-    
-    # Get file path
-    output_files = task.get("output_files", {})
-    file_path = output_files.get(file_type)
-    
+    import re
+
+    file_path = None
+    original_filename = "translated"
+
+    # Phase 1: Try active_tasks (current session)
+    if task_id in active_tasks:
+        task = active_tasks[task_id]
+
+        # Verify task belongs to current user
+        if task["username"] != current_user['username']:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        if task["status"] != "completed":
+            raise HTTPException(status_code=400, detail="Translation not completed")
+
+        output_files = task.get("output_files", {})
+        file_path = output_files.get(file_type)
+        original_filename = task.get("original_filename", "translated")
+    else:
+        # Phase 2: Fallback to history.json (handles server restart)
+        user_dir = user_manager.get_user_dir(current_user['username'])
+        history_file = user_dir / "history.json"
+
+        if history_file.exists():
+            history = json.loads(await asyncio.to_thread(history_file.read_text))
+            for item in history:
+                if item.get("task_id") == task_id:
+                    if item.get("status") != "completed":
+                        raise HTTPException(status_code=400, detail="Translation not completed")
+                    path_key = f"{file_type}_path"
+                    file_path = item.get(path_key)
+                    original_filename = item.get("original_filename", "translated")
+                    break
+
     if not file_path or not Path(file_path).exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
+
     # Generate clean filename: originalname_mono/dual.pdf
-    original_filename = task.get("original_filename", "translated")
-    # Remove .pdf extension if present
     if original_filename.lower().endswith('.pdf'):
         original_filename = original_filename[:-4]
     # Remove UUID prefix if present (format: uuid_filename)
     if '_' in original_filename:
         parts = original_filename.split('_', 1)
-        # Check if first part looks like UUID (32+ hex chars with dashes)
         if len(parts[0]) >= 32 or (len(parts[0]) == 36 and '-' in parts[0]):
             original_filename = parts[1] if len(parts) > 1 else original_filename
-    # Clean filename for safety
-    import re
     clean_name = re.sub(r'[^\w\-\u4e00-\u9fff\.]', '_', original_filename)
-    # Generate download filename: originalname_mono/dual.pdf
     download_filename = f"{clean_name}_{file_type}.pdf"
-    
+
     return FileResponse(
         file_path,
         media_type="application/pdf",

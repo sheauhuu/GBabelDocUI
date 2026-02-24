@@ -344,6 +344,19 @@
                 return;
             }
 
+            // Find the button that triggered this download
+            const btn = event && event.currentTarget ? event.currentTarget :
+                (fileType === 'mono' ? document.getElementById('download-mono-btn') :
+                    document.getElementById('download-dual-btn'));
+
+            // Save original button content and disable
+            let originalHTML = '';
+            if (btn) {
+                originalHTML = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> <span>Downloading...</span>';
+            }
+
             try {
                 const token = localStorage.getItem('auth_token');
                 const response = await fetch(`/api/translate/download/${downloadTaskId}?file_type=${fileType}`, {
@@ -353,7 +366,8 @@
                 });
 
                 if (!response.ok) {
-                    throw new Error('Download failed');
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || `Download failed (${response.status})`);
                 }
 
                 // Get filename from Content-Disposition header or use default
@@ -366,19 +380,57 @@
                     }
                 }
 
-                // Create blob and download
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                window.URL.revokeObjectURL(url);
+                const contentLength = response.headers.get('Content-Length');
+                const totalSize = contentLength ? parseInt(contentLength, 10) : 0;
+
+                // For large files (>5MB) with known size, show download progress
+                if (totalSize > 5 * 1024 * 1024 && response.body) {
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let receivedLength = 0;
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        receivedLength += value.length;
+                        const percent = Math.round((receivedLength / totalSize) * 100);
+                        if (btn) {
+                            btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> <span>${percent}%</span>`;
+                        }
+                    }
+
+                    const blob = new Blob(chunks, { type: 'application/pdf' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                } else {
+                    // Small file or unknown size: download directly
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                }
+
+                showAlert(i18n.t('upload.download.success') || 'Download complete!', 'success');
             } catch (error) {
                 console.error('Download error:', error);
-                alert('Download failed: ' + error.message);
+                showAlert((i18n.t('upload.download.failed') || 'Download failed: ') + error.message, 'error');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHTML;
+                }
             }
         }
 

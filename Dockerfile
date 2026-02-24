@@ -6,6 +6,7 @@ WORKDIR /app
 EXPOSE 7860
 
 ENV PYTHONUNBUFFERED=1
+ENV MAX_CONCURRENT_TRANSLATIONS=1
 
 # # Download all required fonts
 # ADD "https://github.com/satbyy/go-noto-universal/releases/download/v7.0/GoNotoKurrent-Regular.ttf" /app/

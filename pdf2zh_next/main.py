@@ -100,7 +100,11 @@ async def main() -> int:
             
             # Use async-compatible uvicorn server
             import uvicorn
-            config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+            config = uvicorn.Config(
+                app, host="0.0.0.0", port=port, log_level="info",
+                timeout_keep_alive=65,
+                limit_concurrency=20,
+            )
             server = uvicorn.Server(config)
             await server.serve()
             return 0
