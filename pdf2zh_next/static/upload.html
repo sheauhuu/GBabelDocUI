@@ -363,13 +363,11 @@
                 const token = localStorage.getItem('auth_token');
                 const response = await fetch(`/api/translate/download/${downloadTaskId}?file_type=${fileType}`, {
                     headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Range': 'bytes=0-'
-                    },
-                    cache: 'no-store'
+                        'Authorization': `Bearer ${token}`
+                    }
                 });
 
-                if (!response.ok && response.status !== 206) {
+                if (!response.ok) {
                     const errorData = await response.json().catch(() => ({}));
                     throw new Error(errorData.detail || `Download failed (${response.status})`);
                 }
